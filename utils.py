@@ -1,6 +1,8 @@
 from scipy.optimize import minimize
 from sklearn.neighbors.kde import KernelDensity
 from sklearn.covariance import LedoitWolf
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_samples
 
 import numpy as np
 import pandas as pd
@@ -354,3 +356,127 @@ def denoiseCov_CRE(lst_cov, flt_q, flt_bandwidth):
                             lst_std=np.sqrt(np.diag(lst_cov)))
     
     return lst_cov_den
+
+
+
+### CLUSTERING ###
+
+def clusterKMeansBase(lst_corr, int_max_numClusters=10, int_num_init=10):
+    """
+    Function that implements the Base Clustering Algorithm
+    """
+    lst_x = np.sqrt((1-pd.DataFrame(data=lst_corr).fillna(0))/2)
+    
+    # Init the observations matrix
+    dtf_silh = pd.Series()
+    for int_n in range(int_num_init):
+        for int_i in range(2, int_max_numClusters+1):
+            skl_kMeans_ = KMeans(n_clusters=int_i,
+                                 n_jobs=1,
+                                 n_init=1)
+            
+            skl_kMeans_ = skl_kMeans_.fit(lst_x)
+            lst_silh = silhouette_samples(X=lst_x,
+                                          labels=skl_kMeans_.labels_)
+            
+            lst_stats = (lst_silh.mean()/lst_silh.std(), dtf_silh.mean()/dtf_silh.std())
+            if np.isnan(lst_stats[1]) or lst_stats[0] > lst_stats[1]:
+                dtf_silh = lst_silh
+                skl_kMeans = skl_kMeans_
+            
+    lst_newId = np.argsort(skl_kMeans.labels_)
+    
+    # Re-order rows of correlation matrix
+    dtf_corr = pd.DataFrame(data=lst_corr)
+    dtf_corr_ord = dtf_corr.iloc[lst_newId]
+    
+    # Re-order columns of correlation matrix
+    dtf_corr_ord = dtf_corr_ord.iloc[:, lst_newId]
+    
+    # Set the member of the clusters
+    dct_clusters = {int_i: dtf_corr.columns[np.where(skl_kMeans.labels_==int_i)[0]].tolist()
+                   for int_i in np.unique(skl_kMeans.labels_)}
+    
+    dtf_silh = pd.Series(data=lst_silh,
+                         index=lst_x.index)
+    
+    return dtf_corr_ord.to_numpy(), dct_clusters, dtf_silh
+
+
+
+### ALLOCATION ###
+
+def minVar_port(lst_cov, lst_mu=None):
+    """
+    Function that calculates the minimum variance portfolio (if lst_mu=ones) or maximum Sharpe ratio out of an empirical covariance matrix
+    :param lst_cov: empirical covariance matrix
+    :param lst_mu: list of empirical means (default: None)
+    return: lst_w: list of weights of the portfolio
+    """
+    lst_cov_inv = np.linalg.inv(lst_cov)
+    lst_ones = np.ones(shape=(lst_cov_inv.shape[0], 1))
+    if lst_mu is None:
+        lst_mu = lst_ones
+        
+    lst_w = np.dot(lst_cov_inv, lst_mu)
+    lst_w /= np.dot(lst_ones.T, lst_w)
+    return lst_w
+
+def optPort_nco(lst_cov, lst_mu=None, int_max_numClusters=None):
+	"""
+	Function that calculates the allocation via Nested Clustered Optimization Algorithm
+	:param lst_cov: (de-noised) empirical covariance matrix
+	:param lst_mu: empirical means
+	:param int_max_numClusters: maximum number of clusters
+	return: dtf_nco_alloc: dataframe with the allocation weights
+	"""
+	dtf_cov = pd.DataFrame(data=lst_cov)
+	if lst_mu is not None:
+		dtf_mu = pd.Series(data=lst_mu[:, 0])
+
+    ### STEP 1: CLUSTER THE CORRELATION MATRIX ###
+    
+    # Convert covariance matrix to correlation matrix
+	lst_corr = covToCorr(lst_cov=lst_cov)
+
+    # Cluster the correlation matrix
+	lst_corr, dct_clusters, _ = clusterKMeansBase(lst_corr=lst_corr,
+												  int_max_numClusters=int_max_numClusters,
+												  int_num_init=10)
+    
+    ### STEP 2: INTRACLUSTER WEIGHTS ###
+
+    # Use the denoised covariance matrix
+	dtf_wIntra = pd.DataFrame(data=0,
+							  index=dtf_cov.index,
+							  columns=dct_clusters.keys())
+    
+    # For every cluster, find the optimal allocation using the minVar_port function
+	for int_i in dct_clusters:
+		lst_cov_ = dtf_cov.loc[dct_clusters[int_i], dct_clusters[int_i]].values
+		if lst_mu is None:
+			lst_mu_ = None
+            
+		else:
+			lst_mu_ = lst_mu.loc[dct_clusters[int_i]].values.reshape(-1,1)
+    
+		dtf_wIntra.loc[dct_clusters[int_i], int_i] = minVar_port(lst_cov=lst_cov_,
+																 lst_mu=lst_mu_).flatten()
+    
+	### STEP 3: INTERCLUSTER WIEGTHS ###
+
+	# Compute the REDUCED COVARIANCE MATRIX, that reports the correlations between clusters
+	# So, the clustering and intracluster optimization steps allow to transform a the Mrkowitz problem
+	# into a well-behaved one, with rho close to 0
+	dtf_cov_ = dtf_wIntra.T.dot(np.dot(dtf_cov,dtf_wIntra))
+	lst_mu_ = (None if lst_mu is None else dtf_wIntra.T.dot(lst_mu))
+	dtf_wInter = pd.Series(data=minVar_port(lst_cov=dtf_cov_.to_numpy(),
+										    lst_mu=lst_mu_).flatten(),
+                           
+						   index=dtf_cov_.index)
+    
+    # Final allocation
+	dtf_nco_alloc = dtf_wIntra.mul(dtf_wInter,
+								   axis=1).sum(axis=1).values.reshape(-1,1)
+    
+	return dtf_nco_alloc
